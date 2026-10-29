@@ -20,8 +20,11 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+    dependencies:
+      - sdk: libz.tbd
     settings:
       base:
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/Bridging.h
         PRODUCT_BUNDLE_IDENTIFIER: com.zipstream.app
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
