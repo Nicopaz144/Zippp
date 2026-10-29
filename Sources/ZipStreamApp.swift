@@ -1,5 +1,8 @@
 import SwiftUI
 import Compression
+import WebKit
+
+let browserUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
 // MARK: - Errores
 
@@ -127,7 +130,9 @@ final class ZipStreamExtractor {
                 } else if sig == 0x02014b50 || sig == 0x06054b50 || sig == 0x06064b50 {
                     state = .done   // llegó el directorio central: ya está todo
                 } else {
-                    throw ZipError.invalid("firma inesperada")
+                    let head = buf[pos..<min(pos + 80, buf.count)]
+                    let text = String(decoding: head, as: UTF8.self).filter { !$0.isNewline && $0.isASCII }
+                    throw ZipError.invalid("firma inesperada. El archivo empieza con: \(text.prefix(60))")
                 }
 
             case .data:
@@ -246,15 +251,20 @@ final class StreamDownloader: NSObject, URLSessionDataDelegate {
     private var failure: Error?
     private var lastReport = Date.distantPast
 
-    func start(url: URL, dest: URL) throws {
+    func start(url: URL, dest: URL, cookie: String? = nil, referer: String? = nil) throws {
         extractor = try ZipStreamExtractor(root: dest)
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 60
         cfg.timeoutIntervalForResource = 60 * 60 * 24
+        cfg.httpShouldSetCookies = false
         session = URLSession(configuration: cfg, delegate: self, delegateQueue: queue)
-        session!.dataTask(with: url).resume()
+        var req = URLRequest(url: url)
+        req.setValue(browserUA, forHTTPHeaderField: "User-Agent")
+        if let c = cookie, !c.isEmpty { req.setValue(c, forHTTPHeaderField: "Cookie") }
+        if let r = referer { req.setValue(r, forHTTPHeaderField: "Referer") }
+        session!.dataTask(with: req).resume()
     }
 
     func cancel() { session?.invalidateAndCancel() }
@@ -263,6 +273,11 @@ final class StreamDownloader: NSObject, URLSessionDataDelegate {
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         if let h = response as? HTTPURLResponse, !(200..<300).contains(h.statusCode) {
             failure = ZipError.invalid("el servidor respondió HTTP \(h.statusCode)")
+            completionHandler(.cancel)
+            return
+        }
+        if let mime = response.mimeType?.lowercased(), mime.contains("html") || mime.contains("json") {
+            failure = ZipError.invalid("el servidor devolvió una página (\(mime)), no un zip. Puede requerir sesión o cookies")
             completionHandler(.cancel)
             return
         }
@@ -308,6 +323,7 @@ final class Model: ObservableObject {
     @Published var status = "Listo"
     @Published var detail = ""
     @Published var running = false
+    @Published var showDownload = false
     private var worker: StreamDownloader?
 
     private func fmt(_ n: Int64) -> String {
@@ -320,6 +336,12 @@ final class Model: ObservableObject {
             status = "URL inválida"
             return
         }
+        start(url: url, cookie: nil, referer: nil)
+    }
+
+    func start(url: URL, cookie: String?, referer: String?) {
+        guard !running else { return }
+        showDownload = true
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let dest = docs.appendingPathComponent("Extraido", isDirectory: true)
 
@@ -350,7 +372,7 @@ final class Model: ObservableObject {
             }
         }
         do {
-            try w.start(url: url, dest: dest)
+            try w.start(url: url, dest: dest, cookie: cookie, referer: referer)
             worker = w
             running = true
             progress = 0
@@ -365,15 +387,148 @@ final class Model: ObservableObject {
     func cancel() { worker?.cancel() }
 }
 
+// MARK: - Navegador integrado
+
+final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDelegate {
+    let webView: WKWebView
+    @Published var address = ""
+    @Published var canGoBack = false
+    var onDownload: ((URL, String?, String?) -> Void)?
+
+    override init() {
+        webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        super.init()
+        webView.customUserAgent = browserUA
+        webView.navigationDelegate = self
+        webView.uiDelegate = self
+        webView.allowsBackForwardNavigationGestures = true
+    }
+
+    func go(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        var s = t
+        if !t.contains("://") {
+            if t.contains(".") && !t.contains(" ") {
+                s = "https://" + t
+            } else {
+                let q = t.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? t
+                s = "https://www.google.com/search?q=" + q
+            }
+        }
+        if let u = URL(string: s) { webView.load(URLRequest(url: u)) }
+    }
+
+    // Enlace de descarga directa (clic en un botón "download")
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,
+                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if navigationAction.shouldPerformDownload, let url = navigationAction.request.url {
+            decisionHandler(.cancel)
+            capture(url)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    // Respuesta que es un archivo (zip, octet-stream, attachment…)
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        var isFile = !navigationResponse.canShowMIMEType
+        if let h = navigationResponse.response as? HTTPURLResponse,
+           let cd = h.value(forHTTPHeaderField: "Content-Disposition")?.lowercased(),
+           cd.contains("attachment") { isFile = true }
+        if isFile, let url = navigationResponse.response.url {
+            decisionHandler(.cancel)
+            capture(url)
+        } else {
+            decisionHandler(.allow)
+        }
+    }
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil { webView.load(navigationAction.request) }
+        return nil
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        address = webView.url?.absoluteString ?? address
+        canGoBack = webView.canGoBack
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        address = webView.url?.absoluteString ?? address
+        canGoBack = webView.canGoBack
+    }
+
+    private func capture(_ url: URL) {
+        let referer = webView.url?.absoluteString
+        webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+            let host = url.host ?? ""
+            let mine = cookies.filter { c in
+                let d = c.domain.hasPrefix(".") ? String(c.domain.dropFirst()) : c.domain
+                return host == d || host.hasSuffix("." + d)
+            }
+            let header = HTTPCookie.requestHeaderFields(with: mine)["Cookie"]
+            DispatchQueue.main.async { self?.onDownload?(url, header, referer) }
+        }
+    }
+}
+
+struct WebContainer: UIViewRepresentable {
+    let webView: WKWebView
+    func makeUIView(context: Context) -> WKWebView { webView }
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+}
+
+// MARK: - Vistas
+
 struct ContentView: View {
     @StateObject private var m = Model()
+    @StateObject private var b = Browser()
 
     var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $m.showDownload) {
+                Text("Navegador").tag(false)
+                Text("Descarga").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .padding(8)
+
+            if m.showDownload { downloadView } else { browserView }
+        }
+        .onAppear {
+            b.onDownload = { url, cookie, ref in m.start(url: url, cookie: cookie, referer: ref) }
+            if b.webView.url == nil { b.go("https://www.google.com") }
+        }
+    }
+
+    var browserView: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Button { b.webView.goBack() } label: { Image(systemName: "chevron.left") }
+                    .disabled(!b.canGoBack)
+                TextField("Buscar o escribir URL", text: $b.address)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.webSearch)
+                    .submitLabel(.go)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .onSubmit { b.go(b.address) }
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 6)
+            WebContainer(webView: b.webView)
+        }
+    }
+
+    var downloadView: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("ZipStream").font(.largeTitle.bold())
-            Text("Descarga un .zip y lo extrae sobre la marcha, sin guardar el zip. Deja la app abierta mientras trabaja.")
+            Text("Navega hasta el archivo y toca su botón de descarga: la app detecta el enlace y empieza sola. Deja la app abierta mientras trabaja.")
                 .font(.subheadline).foregroundColor(.secondary)
-            TextField("https://…/archivo.zip", text: $m.urlText)
+            TextField("…o pega una URL directa", text: $m.urlText)
                 .textFieldStyle(.roundedBorder)
                 .keyboardType(.URL)
                 .textInputAutocapitalization(.never)
