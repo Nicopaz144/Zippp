@@ -10,6 +10,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generar icono
+        run: |
+          python3 -m venv .venv
+          .venv/bin/pip install pillow
+          .venv/bin/python make_icon.py
+
       - name: Instalar XcodeGen
         run: brew install xcodegen
 
