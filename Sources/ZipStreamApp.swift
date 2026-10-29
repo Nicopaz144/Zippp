@@ -1,5 +1,4 @@
 import SwiftUI
-import Compression
 import WebKit
 
 let browserUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
@@ -19,45 +18,40 @@ enum ZipError: LocalizedError {
     }
 }
 
-// MARK: - Inflater (deflate crudo con Compression framework)
+// MARK: - Inflater (deflate crudo con zlib del sistema)
 
 final class Inflater {
-    private var stream: compression_stream
+    private var strm = z_stream()
     private let cap = 1 << 16
     private let out: UnsafeMutablePointer<UInt8>
+    private var ready = false
 
     init() throws {
         out = UnsafeMutablePointer<UInt8>.allocate(capacity: 1 << 16)
-        stream = compression_stream(
-            dst_ptr: UnsafeMutablePointer<UInt8>(bitPattern: 1)!,
-            dst_size: 0,
-            src_ptr: UnsafePointer<UInt8>(bitPattern: 1)!,
-            src_size: 0,
-            state: nil)
-        guard compression_stream_init(&stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else {
-            throw ZipError.inflate
-        }
+        let rc = inflateInit2_(&strm, -15, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+        guard rc == Z_OK else { throw ZipError.inflate }
+        ready = true
     }
 
     deinit {
-        compression_stream_destroy(&stream)
+        if ready { inflateEnd(&strm) }
         out.deallocate()
     }
 
-    /// Devuelve cuántos bytes de entrada consumió y si el flujo deflate terminó.
+    /// Devuelve cuántos bytes de entrada consumió (exacto) y si el flujo deflate terminó.
     func process(_ src: UnsafePointer<UInt8>, _ count: Int,
                  sink: (UnsafePointer<UInt8>, Int) throws -> Void) throws -> (consumed: Int, ended: Bool) {
-        stream.src_ptr = src
-        stream.src_size = count
+        strm.next_in = UnsafeMutablePointer(mutating: src)
+        strm.avail_in = uInt(count)
         while true {
-            stream.dst_ptr = out
-            stream.dst_size = cap
-            let status = compression_stream_process(&stream, 0)
-            let produced = cap - stream.dst_size
+            strm.next_out = out
+            strm.avail_out = uInt(cap)
+            let rc = inflate(&strm, Z_NO_FLUSH)
+            let produced = cap - Int(strm.avail_out)
             if produced > 0 { try sink(out, produced) }
-            if status == COMPRESSION_STATUS_END { return (count - stream.src_size, true) }
-            if status == COMPRESSION_STATUS_ERROR { throw ZipError.inflate }
-            if stream.src_size == 0 && stream.dst_size > 0 { return (count, false) }
+            if rc == Z_STREAM_END { return (count - Int(strm.avail_in), true) }
+            if rc != Z_OK && rc != Z_BUF_ERROR { throw ZipError.inflate }
+            if strm.avail_in == 0 && strm.avail_out > 0 { return (count, false) }
         }
     }
 }
@@ -79,6 +73,7 @@ final class ZipStreamExtractor {
     private var hasDescriptor = false
     private var zip64 = false
     private var remaining: UInt64 = 0
+    private var compSize: UInt64 = 0
 
     private(set) var filesDone = 0
     private(set) var bytesWritten: UInt64 = 0
@@ -132,7 +127,7 @@ final class ZipStreamExtractor {
                 } else {
                     let head = buf[pos..<min(pos + 80, buf.count)]
                     let text = String(decoding: head, as: UTF8.self).filter { !$0.isNewline && $0.isASCII }
-                    throw ZipError.invalid("firma inesperada. El archivo empieza con: \(text.prefix(60))")
+                    throw ZipError.invalid("firma inesperada. Tras \(currentName) empieza con: \(text.prefix(60))")
                 }
 
             case .data:
@@ -156,15 +151,23 @@ final class ZipStreamExtractor {
                         }
                     }
                     pos += r.consumed
+                    compSize += UInt64(r.consumed)
                     if r.ended { try finishEntry() }
                 }
 
             case .descriptor:
                 guard avail >= 4 else { return }
                 let sigLen = (r32(pos) == 0x08074b50) ? 4 : 0
-                let total = sigLen + 4 + (zip64 ? 16 : 8)
-                guard avail >= total else { return }
-                pos += total
+                guard avail >= sigLen + 4 + 16 else { return }
+                let c = pos + sigLen + 4
+                let is32 = UInt64(r32(c)) == compSize
+                let is64 = r64(c) == compSize
+                let big: Bool
+                if is32 && is64 { big = zip64 }
+                else if is32 { big = false }
+                else if is64 { big = true }
+                else { big = zip64 }
+                pos += sigLen + 4 + (big ? 16 : 8)
                 state = .header
             }
         }
@@ -201,18 +204,24 @@ final class ZipStreamExtractor {
         pos += 30 + nameLen + extraLen
         currentName = name
 
-        let dest = try safeURL(name)
+        compSize = 0
+        let skip = name.hasPrefix("__MACOSX/") || name.hasSuffix(".DS_Store")
         if name.hasSuffix("/") {
-            try FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
-            state = .header
+            if !skip {
+                try FileManager.default.createDirectory(at: try safeURL(name), withIntermediateDirectories: true)
+            }
+            state = hasDescriptor ? .descriptor : .header
             return
         }
         if method == 0 && hasDescriptor && csize == 0 {
             throw ZipError.unsupported("archivo sin comprimir con data descriptor")
         }
-        try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
-        FileManager.default.createFile(atPath: dest.path, contents: nil)
-        file = try FileHandle(forWritingTo: dest)
+        if !skip {
+            let dest = try safeURL(name)
+            try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: dest.path, contents: nil)
+            file = try FileHandle(forWritingTo: dest)
+        }
         if method == 8 { inflater = try Inflater() }
         remaining = csize
         state = .data
@@ -227,7 +236,8 @@ final class ZipStreamExtractor {
     }
 
     private func write(_ p: UnsafePointer<UInt8>, _ n: Int) throws {
-        try file?.write(contentsOf: Data(bytes: p, count: n))
+        guard let f = file else { return }
+        try f.write(contentsOf: Data(bytes: p, count: n))
         bytesWritten += UInt64(n)
     }
 
