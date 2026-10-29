@@ -1,5 +1,7 @@
 import SwiftUI
 import WebKit
+import AVFoundation
+import UserNotifications
 
 let browserUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
@@ -75,13 +77,24 @@ final class ZipStreamExtractor {
     private var remaining: UInt64 = 0
     private var compSize: UInt64 = 0
 
-    private(set) var filesDone = 0
-    private(set) var bytesWritten: UInt64 = 0
+    private(set) var filesDone: Int
+    private(set) var bytesWritten: UInt64
+    private let base: UInt64
+    private var dropped: UInt64 = 0
+    private(set) var boundary: UInt64
+    private(set) var boundaryFiles: Int
+    private(set) var boundaryBytes: UInt64
     private(set) var currentName = ""
     var isComplete: Bool { state == .done }
 
-    init(root: URL) throws {
+    init(root: URL, baseOffset: UInt64 = 0, filesDone: Int = 0, bytesWritten: UInt64 = 0) throws {
         self.root = root
+        self.base = baseOffset
+        self.filesDone = filesDone
+        self.bytesWritten = bytesWritten
+        self.boundary = baseOffset
+        self.boundaryFiles = filesDone
+        self.boundaryBytes = bytesWritten
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     }
 
@@ -95,6 +108,7 @@ final class ZipStreamExtractor {
         buf.append(contentsOf: data)
         try run()
         if pos > (1 << 20) {   // compacta lo ya consumido
+            dropped += UInt64(pos)
             buf.removeFirst(pos)
             pos = 0
         }
@@ -114,6 +128,9 @@ final class ZipStreamExtractor {
                 return
 
             case .header:
+                boundary = base + dropped + UInt64(pos)   // aquí no hay estado: punto de reanudación
+                boundaryFiles = filesDone
+                boundaryBytes = bytesWritten
                 guard avail >= 4 else { return }
                 let sig = r32(pos)
                 if sig == 0x04034b50 {
@@ -248,32 +265,163 @@ final class ZipStreamExtractor {
     }
 }
 
-// MARK: - Descarga
+// MARK: - Utilidades
+
+func fmtBytes(_ n: Int64) -> String {
+    ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+}
+
+func fmtTime(_ sec: Double) -> String {
+    guard sec.isFinite, sec >= 0 else { return "—" }
+    let t = Int(sec), h = t / 3600, m = (t % 3600) / 60, s = t % 60
+    if h > 0 { return "\(h) h \(m) min" }
+    if m > 0 { return "\(m) min \(s) s" }
+    return "\(s) s"
+}
+
+func freeSpace() -> Int64 {
+    let u = URL(fileURLWithPath: NSHomeDirectory())
+    let v = try? u.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+    return v?.volumeAvailableCapacityForImportantUsage ?? 0
+}
+
+// MARK: - Punto de reanudación
+
+/// Se guarda en un límite entre archivos del zip: ahí el parser no tiene estado,
+/// así que reanudar solo necesita el offset del flujo.
+struct Checkpoint: Codable {
+    var url: String
+    var cookie: String?
+    var referer: String?
+    var offset: UInt64
+    var files: Int
+    var written: UInt64
+    var total: Int64
+    var name: String
+
+    static let key = "zipstream.checkpoint"
+    static func load() -> Checkpoint? {
+        guard let d = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(Checkpoint.self, from: d)
+    }
+    func save() {
+        if let d = try? JSONEncoder().encode(self) { UserDefaults.standard.set(d, forKey: Checkpoint.key) }
+    }
+    static func clear() { UserDefaults.standard.removeObject(forKey: key) }
+}
+
+struct Snap {
+    var received: Int64      // bytes del zip procesados (posición absoluta en el flujo)
+    var total: Int64
+    var files: Int
+    var written: UInt64
+    var name: String
+    var skipping: Bool
+}
+
+// MARK: - Segundo plano (audio silencioso) y avisos
+
+final class KeepAlive {
+    static let shared = KeepAlive()
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private var active = false
+
+    func start() {
+        guard !active else { return }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+            try session.setActive(true)
+            let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
+            let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 44100)!
+            buffer.frameLength = 44100
+            memset(buffer.floatChannelData![0], 0, Int(buffer.frameLength) * MemoryLayout<Float>.size)
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: format)
+            try engine.start()
+            player.scheduleBuffer(buffer, at: nil, options: .loops, completionHandler: nil)
+            player.play()
+            NotificationCenter.default.addObserver(self, selector: #selector(interrupted(_:)),
+                                                   name: AVAudioSession.interruptionNotification, object: nil)
+            active = true
+        } catch {
+            print("KeepAlive error: \(error)")
+        }
+    }
+
+    @objc private func interrupted(_ n: Notification) {
+        guard let raw = n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+              AVAudioSession.InterruptionType(rawValue: raw) == .ended else { return }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        if !engine.isRunning { try? engine.start() }
+        player.play()
+    }
+
+    func stop() {
+        guard active else { return }
+        player.stop()
+        engine.stop()
+        engine.detach(player)
+        NotificationCenter.default.removeObserver(self)
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        active = false
+    }
+}
+
+enum Notifier {
+    static func requestAuth() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+    static func post(_ title: String, _ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = .default
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+}
+
+// MARK: - Descarga (con reanudación)
 
 final class StreamDownloader: NSObject, URLSessionDataDelegate {
-    var onProgress: ((Int64, Int64, Int, String, UInt64) -> Void)?
+    var onProgress: ((Snap) -> Void)?
     var onFinish: ((Error?) -> Void)?
 
+    private var cp: Checkpoint
+    private let dest: URL
     private var extractor: ZipStreamExtractor?
     private var session: URLSession?
+    private var skipRemaining: UInt64 = 0
     private var received: Int64 = 0
     private var total: Int64 = 0
     private var failure: Error?
     private var lastReport = Date.distantPast
+    private var lastSave = Date.distantPast
 
-    func start(url: URL, dest: URL, cookie: String? = nil, referer: String? = nil) throws {
-        extractor = try ZipStreamExtractor(root: dest)
+    init(checkpoint: Checkpoint, dest: URL) {
+        self.cp = checkpoint
+        self.dest = dest
+        super.init()
+    }
+
+    func start() throws {
+        guard let url = URL(string: cp.url) else { throw ZipError.invalid("URL inválida") }
+        extractor = try ZipStreamExtractor(root: dest, baseOffset: cp.offset,
+                                           filesDone: cp.files, bytesWritten: cp.written)
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
         let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 60
-        cfg.timeoutIntervalForResource = 60 * 60 * 24
+        cfg.timeoutIntervalForResource = 60 * 60 * 24 * 3
         cfg.httpShouldSetCookies = false
         session = URLSession(configuration: cfg, delegate: self, delegateQueue: queue)
+
         var req = URLRequest(url: url)
         req.setValue(browserUA, forHTTPHeaderField: "User-Agent")
-        if let c = cookie, !c.isEmpty { req.setValue(c, forHTTPHeaderField: "Cookie") }
-        if let r = referer { req.setValue(r, forHTTPHeaderField: "Referer") }
+        if let c = cp.cookie, !c.isEmpty { req.setValue(c, forHTTPHeaderField: "Cookie") }
+        if let r = cp.referer { req.setValue(r, forHTTPHeaderField: "Referer") }
+        if cp.offset > 0 { req.setValue("bytes=\(cp.offset)-", forHTTPHeaderField: "Range") }
         session!.dataTask(with: req).resume()
     }
 
@@ -281,25 +429,52 @@ final class StreamDownloader: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        if let h = response as? HTTPURLResponse, !(200..<300).contains(h.statusCode) {
-            failure = ZipError.invalid("el servidor respondió HTTP \(h.statusCode)")
+        func fail(_ msg: String) {
+            failure = ZipError.invalid(msg)
             completionHandler(.cancel)
-            return
+        }
+        guard let h = response as? HTTPURLResponse else { return fail("respuesta no válida") }
+        if [401, 403, 404, 410].contains(h.statusCode) {
+            return fail("HTTP \(h.statusCode): el enlace caducó o requiere sesión. Ve al navegador y toca descargar otra vez: continuará donde quedó")
         }
         if let mime = response.mimeType?.lowercased(), mime.contains("html") || mime.contains("json") {
-            failure = ZipError.invalid("el servidor devolvió una página (\(mime)), no un zip. Puede requerir sesión o cookies")
-            completionHandler(.cancel)
-            return
+            return fail("el servidor devolvió una página (\(mime)), no un zip. Ve al navegador y toca descargar otra vez")
         }
-        total = response.expectedContentLength
+        if h.statusCode == 206 {
+            let cr = (h.value(forHTTPHeaderField: "Content-Range") ?? "").replacingOccurrences(of: "bytes ", with: "")
+            let start = cr.split(separator: "-").first.flatMap { UInt64($0) }
+            guard start == cp.offset else { return fail("el servidor devolvió otro rango") }
+            if let slash = cr.lastIndex(of: "/"), let t = Int64(cr[cr.index(after: slash)...]) { total = t } else { total = cp.total }
+            received = Int64(cp.offset)
+            skipRemaining = 0
+        } else if h.statusCode == 200 {
+            // El servidor ignoró Range: se vuelve a bajar y se descarta lo ya extraído
+            total = response.expectedContentLength
+            received = 0
+            skipRemaining = cp.offset
+        } else {
+            return fail("HTTP \(h.statusCode)")
+        }
+        if cp.offset > 0, cp.total > 0, total > 0, total != cp.total {
+            return fail("el archivo cambió en el servidor")
+        }
+        cp.total = total
         completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard failure == nil else { return }
+        var d = data
+        if skipRemaining > 0 {
+            let n = min(UInt64(d.count), skipRemaining)
+            skipRemaining -= n
+            received += Int64(n)
+            d = d.dropFirst(Int(n))
+            if d.isEmpty { report(); return }
+        }
         do {
-            try extractor?.feed(data)
-            received += Int64(data.count)
+            try extractor?.feed(d)
+            received += Int64(d.count)
             report()
         } catch {
             failure = error
@@ -318,28 +493,55 @@ final class StreamDownloader: NSObject, URLSessionDataDelegate {
 
     private func report(force: Bool = false) {
         let now = Date()
-        guard force || now.timeIntervalSince(lastReport) > 0.25 else { return }
+        guard force || now.timeIntervalSince(lastReport) > 0.5, let ex = extractor else { return }
         lastReport = now
-        onProgress?(received, total, extractor?.filesDone ?? 0,
-                    extractor?.currentName ?? "", extractor?.bytesWritten ?? 0)
+        onProgress?(Snap(received: received, total: total, files: ex.filesDone,
+                         written: ex.bytesWritten, name: ex.currentName, skipping: skipRemaining > 0))
+        if force || now.timeIntervalSince(lastSave) > 2 {
+            var c = cp
+            c.offset = ex.boundary
+            c.files = ex.boundaryFiles
+            c.written = ex.boundaryBytes
+            c.total = total
+            c.save()
+            lastSave = now
+        }
     }
 }
 
-// MARK: - Modelo y vista
+// MARK: - Modelo
 
 final class Model: ObservableObject {
+    struct Row: Identifiable { let id: String; let value: String }
+
     @Published var urlText = ""
     @Published var progress = 0.0
     @Published var status = "Listo"
-    @Published var detail = ""
+    @Published var rows: [Row] = []
     @Published var running = false
     @Published var showDownload = false
-    private var worker: StreamDownloader?
+    @Published var pending: Checkpoint?
 
-    private func fmt(_ n: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: n, countStyle: .file)
+    private var worker: StreamDownloader?
+    private var userPaused = false
+    private var attempts = 0
+    private var startDate = Date()
+    private var lastTime: Date?
+    private var lastReceived: Int64 = 0
+    private var speed = 0.0
+
+    init() {
+        pending = Checkpoint.load()
+        showDownload = pending != nil
+        if let p = pending { status = "Descarga pendiente: \(p.name)" }
     }
 
+    private var destination: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Extraido", isDirectory: true)
+    }
+
+    // URL pegada a mano
     func start() {
         let text = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: text), url.scheme?.hasPrefix("http") == true else {
@@ -349,52 +551,141 @@ final class Model: ObservableObject {
         start(url: url, cookie: nil, referer: nil)
     }
 
+    // Enlace capturado por el navegador: si coincide con una descarga pendiente, continúa donde quedó
     func start(url: URL, cookie: String?, referer: String?) {
         guard !running else { return }
         showDownload = true
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let dest = docs.appendingPathComponent("Extraido", isDirectory: true)
+        var cp = Checkpoint(url: url.absoluteString, cookie: cookie, referer: referer,
+                            offset: 0, files: 0, written: 0, total: 0, name: url.lastPathComponent)
+        if let old = Checkpoint.load(), old.name == cp.name {
+            cp.offset = old.offset; cp.files = old.files; cp.written = old.written; cp.total = old.total
+        }
+        attempts = 0
+        begin(cp)
+    }
 
-        let w = StreamDownloader()
-        w.onProgress = { [weak self] rec, tot, files, name, written in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.progress = tot > 0 ? Double(rec) / Double(tot) : 0
-                self.status = tot > 0 ? "Descargado \(self.fmt(rec)) de \(self.fmt(tot))" : "Descargado \(self.fmt(rec))"
-                self.detail = "\(files) archivos · escrito \(self.fmt(Int64(written)))\n\(name)"
-            }
+    func resume() {
+        guard !running, let p = pending else { return }
+        attempts = 0
+        begin(p)
+    }
+
+    func discard() {
+        Checkpoint.clear()
+        pending = nil
+        rows = []
+        progress = 0
+        status = "Listo"
+    }
+
+    func cancel() {
+        userPaused = true
+        if let w = worker {
+            w.cancel()
+        } else {
+            running = false
+            KeepAlive.shared.stop()
+            pending = Checkpoint.load()
+            status = "Pausado"
         }
-        w.onFinish = { [weak self] err in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.running = false
-                UIApplication.shared.isIdleTimerDisabled = false
-                if let err = err {
-                    if (err as? URLError)?.code == .cancelled {
-                        self.status = "Cancelado"
-                    } else {
-                        self.status = "Error: \(err.localizedDescription)"
-                    }
-                } else {
-                    self.progress = 1
-                    self.status = "Listo. Archivos › ZipStream › Extraido"
-                }
-            }
-        }
+    }
+
+    private func begin(_ cp: Checkpoint) {
+        userPaused = false
+        let w = StreamDownloader(checkpoint: cp, dest: destination)
+        w.onProgress = { [weak self] s in DispatchQueue.main.async { self?.update(s) } }
+        w.onFinish = { [weak self] err in DispatchQueue.main.async { self?.finished(err) } }
         do {
-            try w.start(url: url, dest: dest, cookie: cookie, referer: referer)
+            try w.start()
             worker = w
             running = true
-            progress = 0
-            status = "Conectando…"
-            detail = ""
-            UIApplication.shared.isIdleTimerDisabled = true   // mantener la pantalla encendida
+            pending = nil
+            status = cp.offset > 0 ? "Reanudando…" : "Conectando…"
+            startDate = Date()
+            lastTime = nil
+            speed = 0
+            KeepAlive.shared.start()
+            if attempts == 0 { Notifier.requestAuth() }
         } catch {
             status = "Error: \(error.localizedDescription)"
         }
     }
 
-    func cancel() { worker?.cancel() }
+    private func update(_ s: Snap) {
+        let now = Date()
+        if let lt = lastTime {
+            let dt = now.timeIntervalSince(lt)
+            if dt > 0.05 {
+                let inst = Double(s.received - lastReceived) / dt
+                speed = speed == 0 ? inst : speed * 0.85 + inst * 0.15
+                lastTime = now
+                lastReceived = s.received
+            }
+        } else {
+            lastTime = now
+            lastReceived = s.received
+        }
+
+        progress = s.total > 0 ? Double(s.received) / Double(s.total) : 0
+        status = s.skipping ? "Reanudando: saltando lo ya extraído…" : "Descargando \(Int(progress * 100)) %"
+
+        let written = Int64(clamping: s.written)
+        var est: Int64 = 0
+        if !s.skipping, s.total > 0, s.received > 50_000_000 {
+            est = Int64(Double(s.written) / Double(s.received) * Double(s.total))
+        }
+        let eta = (speed > 1000 && s.total > 0) ? fmtTime(Double(max(0, s.total - s.received)) / speed) : "calculando…"
+
+        var r: [Row] = [
+            Row(id: "Velocidad", value: "\(fmtBytes(Int64(max(0, speed))))/s"),
+            Row(id: "Tiempo restante", value: eta),
+            Row(id: "Transcurrido", value: fmtTime(now.timeIntervalSince(startDate))),
+            Row(id: "Descargado", value: s.total > 0 ? "\(fmtBytes(s.received)) de \(fmtBytes(s.total))" : fmtBytes(s.received)),
+            Row(id: "Extraído", value: est > 0 ? "\(fmtBytes(written)) de ≈\(fmtBytes(est))" : fmtBytes(written)),
+        ]
+        if est > written { r.append(Row(id: "Falta por extraer", value: "≈\(fmtBytes(est - written))")) }
+        r.append(Row(id: "Archivos extraídos", value: "\(s.files)"))
+        r.append(Row(id: "Espacio libre", value: fmtBytes(freeSpace())))
+        r.append(Row(id: "Archivo actual", value: s.name))
+        rows = r
+    }
+
+    private func finished(_ err: Error?) {
+        worker = nil
+        if err == nil {
+            Checkpoint.clear()
+            pending = nil
+            running = false
+            progress = 1
+            status = "✅ Completado en \(fmtTime(Date().timeIntervalSince(startDate)))"
+            KeepAlive.shared.stop()
+            Notifier.post("ZipStream", "Descarga y extracción completas")
+            return
+        }
+        let urlErr = err as? URLError
+        if userPaused || urlErr?.code == .cancelled {
+            running = false
+            KeepAlive.shared.stop()
+            pending = Checkpoint.load()
+            status = "Pausado"
+            return
+        }
+        if urlErr != nil, attempts < 30 {
+            attempts += 1
+            status = "Sin conexión. Reintentando (\(attempts)/30)…"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                guard let self = self, self.running, !self.userPaused, self.worker == nil,
+                      let cp = Checkpoint.load() else { return }
+                self.begin(cp)
+            }
+            return
+        }
+        running = false
+        KeepAlive.shared.stop()
+        pending = Checkpoint.load()
+        status = "Error: \(err!.localizedDescription)"
+        Notifier.post("ZipStream", "La descarga se detuvo. Ábrela para reanudar.")
+    }
 }
 
 // MARK: - Navegador integrado
@@ -534,26 +825,54 @@ struct ContentView: View {
     }
 
     var downloadView: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("ZipStream").font(.largeTitle.bold())
-            Text("Navega hasta el archivo y toca su botón de descarga: la app detecta el enlace y empieza sola. Deja la app abierta mientras trabaja.")
-                .font(.subheadline).foregroundColor(.secondary)
-            TextField("…o pega una URL directa", text: $m.urlText)
-                .textFieldStyle(.roundedBorder)
-                .keyboardType(.URL)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled(true)
-                .disabled(m.running)
-            ProgressView(value: m.progress)
-            Text(m.status).font(.callout)
-            Text(m.detail).font(.footnote).foregroundColor(.secondary)
-            Button(m.running ? "Cancelar" : "Descargar y extraer") {
-                if m.running { m.cancel() } else { m.start() }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("ZipStream").font(.largeTitle.bold())
+
+                if let p = m.pending, !m.running {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Descarga pendiente").font(.headline)
+                        Text("\(p.name)\n\(p.files) archivos extraídos · continúa desde \(fmtBytes(Int64(clamping: p.offset)))")
+                            .font(.footnote).foregroundColor(.secondary)
+                        HStack {
+                            Button("Reanudar") { m.resume() }.buttonStyle(.borderedProminent)
+                            Button("Descartar", role: .destructive) { m.discard() }.buttonStyle(.bordered)
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.gray.opacity(0.15))
+                    .cornerRadius(12)
+                }
+
+                Text("Navega hasta el archivo y toca su botón de descarga. Sigue en segundo plano y se reanuda solo si se corta.")
+                    .font(.subheadline).foregroundColor(.secondary)
+                TextField("…o pega una URL directa", text: $m.urlText)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .disabled(m.running)
+
+                ProgressView(value: m.progress)
+                Text(m.status).font(.headline)
+
+                ForEach(m.rows) { r in
+                    HStack(alignment: .top) {
+                        Text(r.id).foregroundColor(.secondary)
+                        Spacer(minLength: 12)
+                        Text(r.value).multilineTextAlignment(.trailing)
+                    }
+                    .font(.footnote)
+                }
+
+                Button(m.running ? "Pausar" : "Descargar y extraer") {
+                    if m.running { m.cancel() } else { m.start() }
+                }
+                .buttonStyle(.borderedProminent)
             }
-            .buttonStyle(.borderedProminent)
-            Spacer()
+            .padding()
         }
-        .padding()
     }
 }
 
