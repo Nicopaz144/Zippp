@@ -17,6 +17,8 @@ targets:
         CFBundleVersion: "1"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
+        UIBackgroundModes:
+          - audio
         LSSupportsOpeningDocumentsInPlace: true
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
