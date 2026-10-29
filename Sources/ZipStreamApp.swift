@@ -76,6 +76,7 @@ final class ZipStreamExtractor {
     private var zip64 = false
     private var remaining: UInt64 = 0
     private var compSize: UInt64 = 0
+    private var unknownStored = false
 
     private(set) var filesDone: Int
     private(set) var bytesWritten: UInt64
@@ -148,6 +149,28 @@ final class ZipStreamExtractor {
                 }
 
             case .data:
+                if unknownStored {
+                    // Archivo sin comprimir y sin tamaño en la cabecera: se busca el data descriptor
+                    // (PK\x07\x08) y se valida que su tamaño coincida con los bytes recibidos.
+                    var i = pos
+                    var stop = max(pos, buf.count - 3)
+                    var found = false
+                    while let j = findDescSig(from: i) {
+                        if j + 24 > buf.count { stop = j; break }       // faltan bytes para validar
+                        let got = compSize + UInt64(j - pos)
+                        if UInt64(r32(j + 8)) == got || r64(j + 8) == got { stop = j; found = true; break }
+                        i = j + 1
+                    }
+                    let n = stop - pos
+                    if n > 0 {
+                        let start = pos
+                        try buf.withUnsafeBufferPointer { p in try self.write(p.baseAddress! + start, n) }
+                        compSize += UInt64(n)
+                        pos += n
+                    }
+                    if found { try finishEntry(); continue }
+                    return
+                }
                 if method == 0 {
                     if remaining == 0 { try finishEntry(); continue }
                     guard avail > 0 else { return }
@@ -157,6 +180,7 @@ final class ZipStreamExtractor {
                         try self.write(p.baseAddress! + start, n)
                     }
                     pos += n
+                    compSize += UInt64(n)
                     remaining -= UInt64(n)
                 } else {
                     guard avail > 0 else { return }
@@ -187,6 +211,18 @@ final class ZipStreamExtractor {
                 pos += sigLen + 4 + (big ? 16 : 8)
                 state = .header
             }
+        }
+    }
+
+    private func findDescSig(from start: Int) -> Int? {
+        buf.withUnsafeBufferPointer { p in
+            var i = start
+            let n = p.count - 3
+            while i < n {
+                if p[i] == 0x50 && p[i + 1] == 0x4b && p[i + 2] == 0x07 && p[i + 3] == 0x08 { return i }
+                i += 1
+            }
+            return nil
         }
     }
 
@@ -230,9 +266,7 @@ final class ZipStreamExtractor {
             state = hasDescriptor ? .descriptor : .header
             return
         }
-        if method == 0 && hasDescriptor && csize == 0 {
-            throw ZipError.unsupported("archivo sin comprimir con data descriptor")
-        }
+        unknownStored = (method == 0 && hasDescriptor && csize == 0)
         if !skip {
             let dest = try safeURL(name)
             try FileManager.default.createDirectory(at: dest.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -694,7 +728,8 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     let webView: WKWebView
     @Published var address = ""
     @Published var canGoBack = false
-    var onDownload: ((URL, String?, String?) -> Void)?
+    @Published var canGoForward = false
+    var onDownload: ((URL, String?, String?, Int64) -> Void)?
 
     override init() {
         webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
@@ -725,7 +760,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                  decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
         if navigationAction.shouldPerformDownload, let url = navigationAction.request.url {
             decisionHandler(.cancel)
-            capture(url)
+            capture(url, size: -1)
             return
         }
         decisionHandler(.allow)
@@ -740,7 +775,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
            cd.contains("attachment") { isFile = true }
         if isFile, let url = navigationResponse.response.url {
             decisionHandler(.cancel)
-            capture(url)
+            capture(url, size: navigationResponse.response.expectedContentLength)
         } else {
             decisionHandler(.allow)
         }
@@ -755,14 +790,16 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         address = webView.url?.absoluteString ?? address
         canGoBack = webView.canGoBack
+        canGoForward = webView.canGoForward
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         address = webView.url?.absoluteString ?? address
         canGoBack = webView.canGoBack
+        canGoForward = webView.canGoForward
     }
 
-    private func capture(_ url: URL) {
+    private func capture(_ url: URL, size: Int64) {
         let referer = webView.url?.absoluteString
         webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
             let host = url.host ?? ""
@@ -771,7 +808,7 @@ final class Browser: NSObject, ObservableObject, WKNavigationDelegate, WKUIDeleg
                 return host == d || host.hasSuffix("." + d)
             }
             let header = HTTPCookie.requestHeaderFields(with: mine)["Cookie"]
-            DispatchQueue.main.async { self?.onDownload?(url, header, referer) }
+            DispatchQueue.main.async { self?.onDownload?(url, header, referer, size) }
         }
     }
 }
@@ -782,96 +819,321 @@ struct WebContainer: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {}
 }
 
+// MARK: - Tema (azul y negro)
+
+enum Theme {
+    static let blue = Color(red: 0.04, green: 0.52, blue: 1.0)
+    static let card = Color(red: 0.05, green: 0.07, blue: 0.12)
+    static let stroke = Color(red: 0.12, green: 0.32, blue: 0.70).opacity(0.55)
+    static let gradient = LinearGradient(
+        colors: [Color(red: 0.30, green: 0.70, blue: 1.0), Color(red: 0.0, green: 0.31, blue: 0.95)],
+        startPoint: .topLeading, endPoint: .bottomTrailing)
+}
+
+struct BlueButton: ButtonStyle {
+    var filled = true
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.headline)
+            .foregroundColor(.white)
+            .padding(.vertical, 12)
+            .padding(.horizontal, 22)
+            .frame(maxWidth: .infinity)
+            .background(filled ? AnyShapeStyle(Theme.gradient) : AnyShapeStyle(Color.white.opacity(0.09)))
+            .clipShape(Capsule())
+            .opacity(configuration.isPressed ? 0.75 : 1)
+    }
+}
+
+struct GradientBar: View {
+    var value: Double
+    var body: some View {
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.white.opacity(0.10))
+                Capsule().fill(Theme.gradient)
+                    .frame(width: max(10, g.size.width * CGFloat(min(max(value, 0), 1))))
+                    .shadow(color: Theme.blue.opacity(0.6), radius: 6)
+            }
+        }
+        .frame(height: 10)
+        .animation(.easeOut(duration: 0.4), value: value)
+    }
+}
+
+struct Card<Content: View>: View {
+    let content: Content
+    init(@ViewBuilder content: () -> Content) { self.content = content() }
+    var body: some View {
+        content
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.card)
+            .clipShape(RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).stroke(Theme.stroke, lineWidth: 1))
+    }
+}
+
+struct Capture: Identifiable {
+    let id = UUID()
+    let url: URL
+    let cookie: String?
+    let referer: String?
+    let size: Int64
+    var name: String {
+        let n = url.lastPathComponent
+        return n.isEmpty ? "archivo" : n
+    }
+}
+
 // MARK: - Vistas
 
 struct ContentView: View {
     @StateObject private var m = Model()
     @StateObject private var b = Browser()
+    @State private var capture: Capture?
 
     var body: some View {
-        VStack(spacing: 0) {
-            Picker("", selection: $m.showDownload) {
-                Text("Navegador").tag(false)
-                Text("Descarga").tag(true)
+        ZStack {
+            Color.black.ignoresSafeArea()
+            VStack(spacing: 0) {
+                tabBar
+                if m.showDownload { downloadView } else { browserView }
             }
-            .pickerStyle(.segmented)
-            .padding(8)
-
-            if m.showDownload { downloadView } else { browserView }
+            if let c = capture { confirmCard(c) }
         }
+        .animation(.easeInOut(duration: 0.25), value: capture?.id)
+        .preferredColorScheme(.dark)
+        .tint(Theme.blue)
         .onAppear {
-            b.onDownload = { url, cookie, ref in m.start(url: url, cookie: cookie, referer: ref) }
+            b.onDownload = { url, cookie, ref, size in
+                if capture == nil { capture = Capture(url: url, cookie: cookie, referer: ref, size: size) }
+            }
             if b.webView.url == nil { b.go("https://www.google.com") }
         }
     }
 
+    // MARK: Barra de pestañas
+
+    var tabBar: some View {
+        HStack(spacing: 4) {
+            tabButton("Navegador", "globe", !m.showDownload) { m.showDownload = false }
+            tabButton("Descarga", "arrow.down.circle.fill", m.showDownload) { m.showDownload = true }
+        }
+        .padding(4)
+        .background(Theme.card)
+        .clipShape(Capsule())
+        .overlay(Capsule().stroke(Theme.stroke))
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    func tabButton(_ title: String, _ icon: String, _ selected: Bool, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.subheadline.weight(.semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 9)
+                .foregroundColor(selected ? .white : .secondary)
+                .background(selected ? AnyShapeStyle(Theme.gradient) : AnyShapeStyle(Color.clear))
+                .clipShape(Capsule())
+        }
+    }
+
+    // MARK: Navegador
+
+    func iconButton(_ name: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: name)
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: 36, height: 36)
+                .background(Theme.card)
+                .clipShape(Circle())
+                .overlay(Circle().stroke(Theme.stroke))
+        }
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.35)
+    }
+
     var browserView: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 8) {
             HStack(spacing: 8) {
-                Button { b.webView.goBack() } label: { Image(systemName: "chevron.left") }
-                    .disabled(!b.canGoBack)
-                TextField("Buscar o escribir URL", text: $b.address)
-                    .textFieldStyle(.roundedBorder)
-                    .keyboardType(.webSearch)
-                    .submitLabel(.go)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled(true)
-                    .onSubmit { b.go(b.address) }
+                iconButton("chevron.left", enabled: b.canGoBack) { b.webView.goBack() }
+                iconButton("chevron.right", enabled: b.canGoForward) { b.webView.goForward() }
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass").foregroundColor(.secondary)
+                    TextField("Buscar o escribir URL", text: $b.address)
+                        .keyboardType(.webSearch)
+                        .submitLabel(.go)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                        .onSubmit { b.go(b.address) }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(Theme.card)
+                .clipShape(Capsule())
+                .overlay(Capsule().stroke(Theme.stroke))
+                iconButton("arrow.clockwise", enabled: true) { b.webView.reload() }
             }
-            .padding(.horizontal, 8)
-            .padding(.bottom, 6)
+            .padding(.horizontal, 12)
+
             WebContainer(webView: b.webView)
+                .clipShape(RoundedRectangle(cornerRadius: 14))
+                .padding(.horizontal, 6)
+        }
+    }
+
+    // MARK: Ventana flotante de confirmación
+
+    func confirmCard(_ c: Capture) -> some View {
+        let prev = Checkpoint.load()
+        let resumes = prev?.name == c.name && (prev?.offset ?? 0) > 0
+        let free = freeSpace()
+        let low = c.size > 0 && free < c.size
+        return ZStack {
+            Color.black.opacity(0.6).ignoresSafeArea().onTapGesture { capture = nil }
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.down.circle.fill").font(.title).foregroundStyle(Theme.gradient)
+                    Text("Descarga detectada").font(.title3.bold())
+                }
+                Text(c.name).font(.subheadline.weight(.semibold)).lineLimit(3)
+                Text(c.size > 0 ? fmtBytes(c.size) : "Tamaño desconocido")
+                    .font(.footnote).foregroundColor(.secondary)
+
+                if m.running {
+                    Label("Ya hay una descarga en curso. Páusala antes de empezar otra.", systemImage: "info.circle")
+                        .font(.footnote).foregroundColor(.orange)
+                } else {
+                    if resumes, let p = prev {
+                        Label("Continuará desde \(fmtBytes(Int64(clamping: p.offset)))", systemImage: "arrow.clockwise")
+                            .font(.footnote).foregroundColor(Theme.blue)
+                    }
+                    if low {
+                        Label("Espacio libre insuficiente: \(fmtBytes(free))", systemImage: "exclamationmark.triangle.fill")
+                            .font(.footnote).foregroundColor(.orange)
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    Button("Cancelar") { capture = nil }.buttonStyle(BlueButton(filled: false))
+                    if !m.running {
+                        Button("Descargar") {
+                            m.start(url: c.url, cookie: c.cookie, referer: c.referer)
+                            capture = nil
+                        }
+                        .buttonStyle(BlueButton())
+                    }
+                }
+            }
+            .padding(20)
+            .background(Theme.card)
+            .clipShape(RoundedRectangle(cornerRadius: 24))
+            .overlay(RoundedRectangle(cornerRadius: 24).stroke(Theme.stroke, lineWidth: 1))
+            .shadow(color: Theme.blue.opacity(0.35), radius: 24)
+            .padding(24)
+        }
+        .transition(.opacity)
+    }
+
+    // MARK: Descarga
+
+    func rowValue(_ id: String) -> String { m.rows.first { $0.id == id }?.value ?? "—" }
+
+    var header: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12).fill(Theme.gradient).frame(width: 46, height: 46)
+                Image(systemName: "arrow.down").font(.system(size: 22, weight: .heavy)).foregroundColor(.white)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("ZipStream").font(.title2.bold())
+                Text("Descarga y extrae al instante").font(.caption).foregroundColor(.secondary)
+            }
+            Spacer()
+        }
+    }
+
+    func pendingCard(_ p: Checkpoint) -> some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("Descarga pendiente", systemImage: "pause.circle.fill").font(.headline)
+                Text("\(p.name)\n\(p.files) archivos extraídos · continúa desde \(fmtBytes(Int64(clamping: p.offset)))")
+                    .font(.footnote).foregroundColor(.secondary)
+                HStack(spacing: 10) {
+                    Button("Reanudar") { m.resume() }.buttonStyle(BlueButton())
+                    Button("Descartar") { m.discard() }.buttonStyle(BlueButton(filled: false))
+                }
+            }
+        }
+    }
+
+    var heroCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("\(Int(m.progress * 100))")
+                        .font(.system(size: 54, weight: .heavy, design: .rounded))
+                        .foregroundStyle(Theme.gradient)
+                    Text("%").font(.title2.bold()).foregroundColor(.secondary)
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(rowValue("Tiempo restante")).font(.headline)
+                        Text("restante").font(.caption).foregroundColor(.secondary)
+                    }
+                }
+                GradientBar(value: m.progress)
+                Text(m.status).font(.footnote).foregroundColor(.secondary)
+            }
+        }
+    }
+
+    var statsGrid: some View {
+        let cols = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
+        let items = m.rows.filter { $0.id != "Archivo actual" && $0.id != "Tiempo restante" }
+        return LazyVGrid(columns: cols, spacing: 10) {
+            ForEach(items) { r in
+                Card {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(r.id).font(.caption).foregroundColor(.secondary)
+                        Text(r.value).font(.subheadline.weight(.semibold)).lineLimit(2).minimumScaleFactor(0.7)
+                    }
+                }
+            }
         }
     }
 
     var downloadView: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
-                Text("ZipStream").font(.largeTitle.bold())
-
-                if let p = m.pending, !m.running {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Descarga pendiente").font(.headline)
-                        Text("\(p.name)\n\(p.files) archivos extraídos · continúa desde \(fmtBytes(Int64(clamping: p.offset)))")
-                            .font(.footnote).foregroundColor(.secondary)
-                        HStack {
-                            Button("Reanudar") { m.resume() }.buttonStyle(.borderedProminent)
-                            Button("Descartar", role: .destructive) { m.discard() }.buttonStyle(.bordered)
+                header
+                if let p = m.pending, !m.running { pendingCard(p) }
+                heroCard
+                statsGrid
+                if let f = m.rows.first(where: { $0.id == "Archivo actual" }) {
+                    Card {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Archivo actual").font(.caption).foregroundColor(.secondary)
+                            Text(f.value).font(.footnote.weight(.semibold)).lineLimit(2)
                         }
                     }
-                    .padding()
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.gray.opacity(0.15))
-                    .cornerRadius(12)
                 }
-
-                Text("Navega hasta el archivo y toca su botón de descarga. Sigue en segundo plano y se reanuda solo si se corta.")
-                    .font(.subheadline).foregroundColor(.secondary)
                 TextField("…o pega una URL directa", text: $m.urlText)
-                    .textFieldStyle(.roundedBorder)
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled(true)
                     .disabled(m.running)
-
-                ProgressView(value: m.progress)
-                Text(m.status).font(.headline)
-
-                ForEach(m.rows) { r in
-                    HStack(alignment: .top) {
-                        Text(r.id).foregroundColor(.secondary)
-                        Spacer(minLength: 12)
-                        Text(r.value).multilineTextAlignment(.trailing)
-                    }
-                    .font(.footnote)
-                }
-
+                    .padding(12)
+                    .background(Theme.card)
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(Theme.stroke))
                 Button(m.running ? "Pausar" : "Descargar y extraer") {
                     if m.running { m.cancel() } else { m.start() }
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(BlueButton(filled: !m.running))
             }
-            .padding()
+            .padding(16)
         }
     }
 }
